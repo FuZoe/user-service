@@ -118,11 +118,11 @@ public class JwtUtil {
      */
     private Claims extractAllClaims(String token) {
         try {
-            return Jwts.parserBuilder()
-                    .setSigningKey(getSigningKey())
+            return Jwts.parser()
+                    .verifyWith(getSigningKey())
                     .build()
-                    .parseClaimsJws(token)
-                    .getBody();
+                    .parseSignedClaims(token)
+                    .getPayload();
         } catch (JwtException e) {
             throw new RuntimeException("JWT令牌解析失败", e);
         }
