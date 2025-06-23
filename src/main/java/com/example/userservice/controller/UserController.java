@@ -78,7 +78,7 @@ public class UserController {
      * @param request HTTP请求对象
      * @return 用户信息
      */
-    @GetMapping("/{userId}")
+    @GetMapping("/info/{userId}")
     public ApiResponse<UserInfoResponse> getUserById(
             @PathVariable Long userId,
             HttpServletRequest request) {
