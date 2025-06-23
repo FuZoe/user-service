@@ -22,6 +22,7 @@ public class User {
      * 用户ID（主键，雪花算法生成）
      */
     @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column(name = "user_id")
     private Long userId;
 

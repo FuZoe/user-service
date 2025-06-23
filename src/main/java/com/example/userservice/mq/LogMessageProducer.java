@@ -3,6 +3,7 @@ package com.example.userservice.mq;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -14,9 +15,10 @@ import java.time.format.DateTimeFormatter;
  */
 @Component
 @Slf4j
+@ConditionalOnProperty(name = "rocketmq.name-server", havingValue = "localhost:9876", matchIfMissing = false)
 public class LogMessageProducer {
 
-    @Autowired
+    @Autowired(required = false)
     private RocketMQTemplate rocketMQTemplate;
 
     /**
@@ -123,8 +125,12 @@ public class LogMessageProducer {
      */
     private void sendLogMessage(OperationLogMessage message) {
         try {
-            rocketMQTemplate.convertAndSend(LOG_TOPIC, message);
-            log.info("发送操作日志消息成功: {}", message);
+            if (rocketMQTemplate != null) {
+                rocketMQTemplate.convertAndSend(LOG_TOPIC, message);
+                log.info("发送操作日志消息成功: {}", message);
+            } else {
+                log.debug("RocketMQ未配置，跳过日志消息发送: {}", message);
+            }
         } catch (Exception e) {
             log.error("发送操作日志消息失败: {}", message, e);
         }
