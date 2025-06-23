@@ -1,5 +1,6 @@
 package com.example.userservice.client;
 
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.*;
 
@@ -8,6 +9,7 @@ import org.springframework.web.bind.annotation.*;
  * 通过Feign调用权限服务的接口
  */
 @FeignClient(name = "permission-service", fallback = PermissionServiceClientFallback.class)
+@ConditionalOnProperty(name = "spring.cloud.nacos.discovery.enabled", havingValue = "true")
 public interface PermissionServiceClient {
 
     /**

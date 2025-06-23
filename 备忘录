@@ -1,0 +1,44 @@
+
+编译的指令是：
+
+```bash
+mvn clean compile
+```
+
+这个指令的含义：
+- `mvn` - Maven 命令
+- `clean` - 清理之前的编译结果（删除 target 目录）
+- `compile` - 编译源代码
+
+其他常用的 Maven 编译相关指令：
+
+1. **只编译不清理**：
+   ```bash
+   mvn compile
+   ```
+
+2. **编译并运行测试**：
+   ```bash
+   mvn clean test
+   ```
+
+3. **编译并打包**：
+   ```bash
+   mvn clean package
+   ```
+
+4. **编译并安装到本地仓库**：
+   ```bash
+   mvn clean install
+   ```
+
+5. **跳过测试编译打包**：
+   ```bash
+   mvn clean package -DskipTests
+   ```
+
+6. **查看依赖树**：
+   ```bash
+   mvn dependency:tree
+   ```
+

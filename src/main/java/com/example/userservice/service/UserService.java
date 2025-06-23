@@ -6,11 +6,13 @@ import com.example.userservice.client.UserPermissionResponse;
 import com.example.userservice.dto.*;
 import com.example.userservice.entity.User;
 import com.example.userservice.mq.LogMessageProducer;
+import com.example.userservice.mq.SimpleLogMessageProducer;
 import com.example.userservice.repository.UserRepository;
 import com.example.userservice.util.JwtUtil;
 import io.seata.spring.annotation.GlobalTransactional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -20,6 +22,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Optional;
 
 /**
@@ -33,67 +37,99 @@ public class UserService {
     @Autowired
     private UserRepository userRepository;
 
-    @Autowired
+    @Autowired(required = false)
     private PermissionServiceClient permissionServiceClient;
 
-    @Autowired
+    @Autowired(required = false)
     private LogMessageProducer logMessageProducer;
+
+    @Autowired(required = false)
+    private SimpleLogMessageProducer simpleLogMessageProducer;
 
     @Autowired
     private JwtUtil jwtUtil;
 
+    @Autowired
+    private Environment environment;
+
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     /**
-     * 用户注册（分布式事务）
-     *
-     * @param request 注册请求
-     * @return 注册结果
+     * 用户注册的统一入口
+     * 根据当前激活的profile（环境）选择不同的注册流程
      */
-    @GlobalTransactional(rollbackFor = Exception.class)
     @Transactional
     public ApiResponse<String> register(UserRegisterRequest request) {
-        try {
-            // 1. 参数校验
-            if (userRepository.existsByUsernameAndIsDeleted(request.getUsername(), 0)) {
-                return ApiResponse.error(400, "用户名已存在");
-            }
-
-            if (request.getEmail() != null && userRepository.existsByEmailAndIsDeleted(request.getEmail(), 0)) {
-                return ApiResponse.error(400, "邮箱已被注册");
-            }
-
-            if (request.getPhone() != null && userRepository.existsByPhoneAndIsDeleted(request.getPhone(), 0)) {
-                return ApiResponse.error(400, "手机号已被注册");
-            }
-
-            // 2. 创建用户（分库分表自动路由）
-            User user = new User(
-                    request.getUsername(),
-                    passwordEncoder.encode(request.getPassword()),
-                    request.getEmail(),
-                    request.getPhone()
-            );
-            User savedUser = userRepository.save(user);
-            log.info("用户创建成功: userId={}, username={}", savedUser.getUserId(), savedUser.getUsername());
-
-            // 3. RPC调用权限服务绑定默认角色
-            BindRoleResponse roleResponse = permissionServiceClient.bindDefaultRole(savedUser.getUserId());
-            if (!roleResponse.getSuccess()) {
-                log.error("角色绑定失败: userId={}, message={}", savedUser.getUserId(), roleResponse.getMessage());
-                throw new RuntimeException("角色绑定失败: " + roleResponse.getMessage());
-            }
-            log.info("角色绑定成功: userId={}, roleCode={}", savedUser.getUserId(), roleResponse.getRoleCode());
-
-            // 4. 异步发送注册日志到MQ
-            logMessageProducer.sendUserRegisterLog(savedUser.getUserId(), savedUser.getUsername());
-
-            return ApiResponse.success("注册成功");
-
-        } catch (Exception e) {
-            log.error("用户注册失败", e);
-            return ApiResponse.error("注册失败: " + e.getMessage());
+        // 1. 统一进行参数校验
+        if (userRepository.existsByUsernameAndIsDeleted(request.getUsername(), 0)) {
+            return ApiResponse.error(400, "用户名已存在");
         }
+        if (request.getEmail() != null && userRepository.existsByEmailAndIsDeleted(request.getEmail(), 0)) {
+            return ApiResponse.error(400, "邮箱已被注册");
+        }
+        if (request.getPhone() != null && userRepository.existsByPhoneAndIsDeleted(request.getPhone(), 0)) {
+            return ApiResponse.error(400, "手机号已被注册");
+        }
+
+        // 2. 根据profile选择注册逻辑
+        boolean isSimpleProfile = Arrays.asList(environment.getActiveProfiles()).contains("simple");
+        if (isSimpleProfile) {
+            return registerSimple(request);
+        } else {
+            return registerWithGlobalTransaction(request);
+        }
+    }
+
+    /**
+     * 带有分布式事务的注册流程（生产环境）
+     */
+    @GlobalTransactional(rollbackFor = Exception.class)
+    // 此处无需@Transactional，会由调用方register()的事务传播
+    private ApiResponse<String> registerWithGlobalTransaction(UserRegisterRequest request) {
+        // 创建用户
+        User user = new User(
+                request.getUsername(),
+                passwordEncoder.encode(request.getPassword()),
+                request.getEmail(),
+                request.getPhone()
+        );
+        User savedUser = userRepository.save(user);
+        log.info("用户创建成功: userId={}, username={}", savedUser.getUserId(), savedUser.getUsername());
+
+        // RPC调用权限服务绑定默认角色
+        BindRoleResponse roleResponse = permissionServiceClient.bindDefaultRole(savedUser.getUserId());
+        if (roleResponse == null || !roleResponse.getSuccess()) {
+            throw new RuntimeException("RPC调用失败: 角色绑定失败" + (roleResponse != null ? " - " + roleResponse.getMessage() : ""));
+        }
+        log.info("角色绑定成功: userId={}, roleCode={}", savedUser.getUserId(), roleResponse.getRoleCode());
+
+        // 异步发送注册日志到MQ
+        logMessageProducer.sendUserRegisterLog(savedUser.getUserId(), savedUser.getUsername());
+
+        return ApiResponse.success("注册成功");
+    }
+
+    /**
+     * 简化的注册流程（simple模式）
+     */
+    // 此处无需@Transactional，会由调用方register()的事务传播
+    private ApiResponse<String> registerSimple(UserRegisterRequest request) {
+        // 创建用户
+        User user = new User(
+                request.getUsername(),
+                passwordEncoder.encode(request.getPassword()),
+                request.getEmail(),
+                request.getPhone()
+        );
+        User savedUser = userRepository.save(user);
+        log.info("用户创建成功 (simple mode): userId={}, username={}", savedUser.getUserId(), savedUser.getUsername());
+
+        // 异步发送日志（简化版）
+        if (simpleLogMessageProducer != null) {
+            simpleLogMessageProducer.sendUserRegisterLog(savedUser.getUserId(), savedUser.getUsername());
+        }
+
+        return ApiResponse.success("注册成功");
     }
 
     /**
@@ -132,7 +168,16 @@ public class UserService {
             );
 
             // 5. 异步发送登录日志
-            logMessageProducer.sendUserLoginLog(user.getUserId(), user.getUsername());
+            boolean isSimpleProfile = Arrays.asList(environment.getActiveProfiles()).contains("simple");
+            if (isSimpleProfile) {
+                if (simpleLogMessageProducer != null) {
+                    simpleLogMessageProducer.sendUserLoginLog(user.getUserId(), user.getUsername());
+                }
+            } else {
+                if (logMessageProducer != null) {
+                    logMessageProducer.sendUserLoginLog(user.getUserId(), user.getUsername());
+                }
+            }
 
             return ApiResponse.success("登录成功", response);
 
@@ -152,8 +197,21 @@ public class UserService {
      */
     public ApiResponse<PageResponse<UserInfoResponse>> getUsers(Integer page, Integer size, Long currentUserId) {
         try {
+            boolean isSimpleProfile = Arrays.asList(environment.getActiveProfiles()).contains("simple");
+
             // 1. 获取当前用户权限
-            UserPermissionResponse permission = permissionServiceClient.getUserPermission(currentUserId);
+            UserPermissionResponse permission;
+            if (isSimpleProfile || permissionServiceClient == null) {
+                 log.warn("权限服务未配置，使用默认USER权限");
+                 permission = new UserPermissionResponse(currentUserId, "USER", "普通用户", Collections.singletonList("READ_SELF"));
+            } else {
+                try {
+                    permission = permissionServiceClient.getUserPermission(currentUserId);
+                } catch (Exception e) {
+                    log.error("获取用户权限失败，将使用默认USER权限", e);
+                    permission = new UserPermissionResponse(currentUserId, "USER", "普通用户", Collections.singletonList("READ_SELF"));
+                }
+            }
 
             // 2. 构建分页参数
             Pageable pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "gmtCreate"));
@@ -162,23 +220,14 @@ public class UserService {
             // 3. 根据角色权限查询不同范围的数据
             switch (permission.getRoleCode()) {
                 case "SUPER_ADMIN":
-                    // 超管可以查看所有用户
-                    userPage = userRepository.findAllActiveUsers(pageable);
-                    break;
                 case "ADMIN":
-                    // 管理员可以查看普通用户（需要在权限服务中实现具体逻辑）
                     userPage = userRepository.findAllActiveUsers(pageable);
                     break;
                 case "USER":
                 default:
-                    // 普通用户只能查看自己
                     Optional<User> currentUser = userRepository.findActiveUserById(currentUserId);
-                    if (currentUser.isPresent()) {
-                        userPage = new org.springframework.data.domain.PageImpl<>(
-                                java.util.Arrays.asList(currentUser.get()), pageable, 1);
-                    } else {
-                        userPage = Page.empty(pageable);
-                    }
+                    userPage = currentUser.map(user -> (Page<User>) new org.springframework.data.domain.PageImpl<>(Collections.singletonList(user), pageable, 1))
+                                          .orElseGet(() -> Page.empty(pageable));
                     break;
             }
 
@@ -186,7 +235,9 @@ public class UserService {
             Page<UserInfoResponse> responsePage = userPage.map(this::convertToUserInfoResponse);
 
             // 5. 发送查询日志
-            logMessageProducer.sendUserQueryLog(currentUserId, permission.getRoleName(), null);
+            if (!isSimpleProfile && logMessageProducer != null) {
+                logMessageProducer.sendUserQueryLog(currentUserId, permission.getRoleName(), null);
+            }
 
             return ApiResponse.success(new PageResponse<>(responsePage));
 
@@ -205,22 +256,29 @@ public class UserService {
      */
     public ApiResponse<UserInfoResponse> getUserById(Long userId, Long currentUserId) {
         try {
-            // 1. 获取当前用户权限
-            UserPermissionResponse permission = permissionServiceClient.getUserPermission(currentUserId);
+            boolean isSimpleProfile = Arrays.asList(environment.getActiveProfiles()).contains("simple");
+            UserPermissionResponse permission;
+
+            if (isSimpleProfile || permissionServiceClient == null) {
+                 permission = new UserPermissionResponse(currentUserId, "USER", "普通用户", Collections.singletonList("READ_SELF"));
+            } else {
+                try {
+                    permission = permissionServiceClient.getUserPermission(currentUserId);
+                } catch (Exception e) {
+                     log.error("获取用户权限失败，将使用默认USER权限", e);
+                    permission = new UserPermissionResponse(currentUserId, "USER", "普通用户", Collections.singletonList("READ_SELF"));
+                }
+            }
 
             // 2. 权限检查
             boolean canAccess = false;
             switch (permission.getRoleCode()) {
                 case "SUPER_ADMIN":
-                    canAccess = true;
-                    break;
                 case "ADMIN":
-                    // 管理员可以查看普通用户（简化实现，实际需要检查目标用户角色）
                     canAccess = true;
                     break;
                 case "USER":
                 default:
-                    // 普通用户只能查看自己
                     canAccess = userId.equals(currentUserId);
                     break;
             }
@@ -239,8 +297,9 @@ public class UserService {
             UserInfoResponse response = convertToUserInfoResponse(userOpt.get());
 
             // 5. 发送查询日志
-            logMessageProducer.sendUserQueryLog(currentUserId, permission.getRoleName(), userId);
-
+            if (!isSimpleProfile && logMessageProducer != null) {
+                 logMessageProducer.sendUserQueryLog(currentUserId, permission.getRoleName(), userId);
+            }
             return ApiResponse.success(response);
 
         } catch (Exception e) {
@@ -260,14 +319,24 @@ public class UserService {
     @Transactional
     public ApiResponse<String> updateUser(Long userId, UserUpdateRequest request, Long currentUserId) {
         try {
+            boolean isSimpleProfile = Arrays.asList(environment.getActiveProfiles()).contains("simple");
+            UserPermissionResponse permission;
+            if (isSimpleProfile || permissionServiceClient == null) {
+                 permission = new UserPermissionResponse(currentUserId, "USER", "普通用户", Collections.singletonList("UPDATE_SELF"));
+            } else {
+                 try {
+                    permission = permissionServiceClient.getUserPermission(currentUserId);
+                 } catch (Exception e) {
+                    log.error("获取用户权限失败，将使用默认USER权限", e);
+                    permission = new UserPermissionResponse(currentUserId, "USER", "普通用户", Collections.singletonList("UPDATE_SELF"));
+                 }
+            }
+
             // 1. 权限检查（与查询逻辑类似）
-            UserPermissionResponse permission = permissionServiceClient.getUserPermission(currentUserId);
             boolean canUpdate = false;
 
             switch (permission.getRoleCode()) {
                 case "SUPER_ADMIN":
-                    canUpdate = true;
-                    break;
                 case "ADMIN":
                     canUpdate = true;
                     break;
@@ -308,11 +377,20 @@ public class UserService {
             }
 
             // 4. 保存更新
-            userRepository.save(user);
-
-            // 5. 发送更新日志
-            String fields = updateFields.length() > 0 ? updateFields.substring(0, updateFields.length() - 1) : "无";
-            logMessageProducer.sendUserUpdateLog(userId, user.getUsername(), fields);
+            if (updateFields.length() > 0) {
+                 userRepository.save(user);
+                 // 5. 发送更新日志
+                String fields = updateFields.substring(0, updateFields.length() - 1);
+                if (isSimpleProfile) {
+                    if (simpleLogMessageProducer != null) {
+                        simpleLogMessageProducer.sendUserUpdateLog(userId, user.getUsername(), fields);
+                    }
+                } else {
+                    if (logMessageProducer != null) {
+                        logMessageProducer.sendUserUpdateLog(userId, user.getUsername(), fields);
+                    }
+                }
+            }
 
             return ApiResponse.success("更新成功");
 
@@ -350,7 +428,16 @@ public class UserService {
             userRepository.save(user);
 
             // 4. 发送密码重置日志
-            logMessageProducer.sendPasswordResetLog(user.getUserId(), user.getUsername());
+            boolean isSimpleProfile = Arrays.asList(environment.getActiveProfiles()).contains("simple");
+            if (isSimpleProfile) {
+                if (simpleLogMessageProducer != null) {
+                    simpleLogMessageProducer.sendPasswordResetLog(user.getUserId(), user.getUsername());
+                }
+            } else {
+                 if (logMessageProducer != null) {
+                    logMessageProducer.sendPasswordResetLog(user.getUserId(), user.getUsername());
+                }
+            }
 
             return ApiResponse.success("密码重置成功");
 
